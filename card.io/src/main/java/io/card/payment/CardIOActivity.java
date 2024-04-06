@@ -26,6 +26,7 @@ import android.util.Log;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.OrientationEventListener;
+import android.view.Surface;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup.LayoutParams;
@@ -48,6 +49,18 @@ import io.card.payment.i18n.StringKey;
 import io.card.payment.ui.ActivityHelper;
 import io.card.payment.ui.Appearance;
 import io.card.payment.ui.ViewUtil;
+
+
+/* Tesseract Imports */
+import android.os.Environment;
+import android.content.Context;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+
+
 
 /**
  * This is the entry point {@link android.app.Activity} for a card.io client to use <a
@@ -301,6 +314,8 @@ public final class CardIOActivity extends Activity {
     private FrameLayout mMainLayout;
     private boolean useApplicationTheme;
 
+    static private int numActivityAllocations;
+
     private CardScanner mCardScanner;
 
     private boolean manualEntryFallbackOrForced = false;
@@ -323,6 +338,18 @@ public final class CardIOActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        Log.i(TAG, "onCreate()");
+        tessSetup();
+        numActivityAllocations++;
+        // NOTE: java native asserts are disabled by default on Android.
+        if (numActivityAllocations != 1) {
+            // it seems that this can happen in the autotest loop, but it doesn't seem to break.
+            // was happening for lemon... (ugh, long story) but we're now protecting the underlying
+            // DMZ/scanner from over-release.
+            Log.i(TAG, String.format(
+                    "INTERNAL WARNING: There are %d (not 1) CardIOActivity allocations!",
+                    numActivityAllocations));
+        }
 
         final Intent clientData = this.getIntent();
 
@@ -356,15 +383,19 @@ public final class CardIOActivity extends Activity {
         }
 
         if (clientData.getBooleanExtra(EXTRA_NO_CAMERA, false)) {
+            Log.i(Util.PUBLIC_LOG_TAG, "EXTRA_NO_CAMERA set to true. Skipping camera.");
             manualEntryFallbackOrForced = true;
         } else if (!CardScanner.processorSupported()){
+            Log.i(Util.PUBLIC_LOG_TAG, "Processor not Supported. Skipping camera.");
             manualEntryFallbackOrForced = true;
         } else {
             try {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                    if (!waitingForPermission) {
-                        if (checkSelfPermission(Manifest.permission.CAMERA) ==
-                                PackageManager.PERMISSION_DENIED) {
+                    if(!waitingForPermission) {
+                        if (checkSelfPermission(Manifest.permission.CAMERA)
+                                == PackageManager.PERMISSION_DENIED) {
+
+                            Log.d(TAG, "permission denied to camera - requesting it");
                             String[] permissions = {Manifest.permission.CAMERA};
                             waitingForPermission = true;
                             requestPermissions(permissions, PERMISSION_REQUEST_ID);
@@ -405,8 +436,10 @@ public final class CardIOActivity extends Activity {
         }
     }
 
+
     private void finishIfSuppressManualEntry() {
         if (suppressManualEntry) {
+            Log.i(Util.PUBLIC_LOG_TAG, "Camera not available and manual entry suppressed.");
             setResultAndFinish(RESULT_SCAN_NOT_AVAILABLE, null);
         }
     }
@@ -452,7 +485,8 @@ public final class CardIOActivity extends Activity {
 
             if (getIntent().getBooleanExtra(PRIVATE_EXTRA_CAMERA_BYPASS_TEST_MODE, false)) {
                 if (!this.getPackageName().contentEquals("io.card.development")) {
-                    throw new IllegalStateException("Illegal access of private extra");
+                    Log.e(TAG, this.getPackageName() + " is not correct");
+                    throw new IllegalStateException("illegal access of private extra");
                 }
                 // use reflection here so that the tester can be safely stripped for release
                 // builds.
@@ -485,7 +519,8 @@ public final class CardIOActivity extends Activity {
         StringKey errorKey = StringKey.ERROR_CAMERA_UNEXPECTED_FAIL;
         String localizedError = LocalizedStrings.getString(errorKey);
 
-        Log.e(Util.PUBLIC_LOG_TAG, "Unknown exception, please post the stack trace as a GitHub issue", e);
+        Log.e(Util.PUBLIC_LOG_TAG,
+                "Unknown exception - please send the stack trace to support@card.io", e);
         Toast toast = Toast.makeText(this, localizedError, Toast.LENGTH_LONG);
         toast.setGravity(Gravity.CENTER, 0, TOAST_OFFSET_Y);
         toast.show();
@@ -493,6 +528,10 @@ public final class CardIOActivity extends Activity {
     }
 
     private void doOrientationChange(int orientation) {
+        // This method calls every time the orientation changes by a degree.
+        // Don't enable logging unless doing rotational testing.
+        // Log.d(TAG, "doOrientationChange(" + orientation + ")");
+
         if (orientation < 0 || mCardScanner == null) {
             return;
         }
@@ -522,6 +561,8 @@ public final class CardIOActivity extends Activity {
             mFrameOrientation = ORIENTATION_LANDSCAPE_RIGHT;
         }
         if (degrees >= 0 && degrees != mLastDegrees) {
+            Log.d(TAG, "onOrientationChanged(" + degrees + ") calling setDeviceOrientation("
+                    + mFrameOrientation + ")");
             mCardScanner.setDeviceOrientation(mFrameOrientation);
             setDeviceDegrees(degrees);
             if (degrees == 90) {
@@ -541,16 +582,12 @@ public final class CardIOActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        Log.i(TAG, "onResume()");
 
-        if (!waitingForPermission) {
+        if(!waitingForPermission) {
             if (manualEntryFallbackOrForced) {
-                if (suppressManualEntry) {
-                    finishIfSuppressManualEntry();
-                    return;
-                } else {
-                    nextActivity();
-                    return;
-                }
+                nextActivity();
+                return;
             }
 
             Util.logNativeMemoryStats();
@@ -563,6 +600,7 @@ public final class CardIOActivity extends Activity {
             orientationListener.enable();
 
             if (!restartPreview()) {
+                Log.e(TAG, "Could not connect to camera.");
                 StringKey error = StringKey.ERROR_CAMERA_UNEXPECTED_FAIL;
                 showErrorMessage(LocalizedStrings.getString(error));
                 nextActivity();
@@ -585,6 +623,7 @@ public final class CardIOActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        Log.i(TAG, "onPause()");
 
         if (orientationListener != null) {
             orientationListener.disable();
@@ -598,7 +637,9 @@ public final class CardIOActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        Log.d(TAG, "onDestroy()");
         mOverlay = null;
+        numActivityAllocations--;
 
         if (orientationListener != null) {
             orientationListener.disable();
@@ -614,15 +655,20 @@ public final class CardIOActivity extends Activity {
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode, String permissions[],
-                                           int[] grantResults) {
-        if (requestCode == PERMISSION_REQUEST_ID) {
-            waitingForPermission = false;
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                showCameraScannerOverlay();
-            } else {
-                // show manual entry - handled in onResume()
-                manualEntryFallbackOrForced = true;
+    public void onRequestPermissionsResult(int requestCode,
+                                           String permissions[], int[] grantResults) {
+        switch (requestCode) {
+            case PERMISSION_REQUEST_ID: {
+                waitingForPermission = false;
+                if (grantResults.length > 0
+                        && grantResults[0] == PackageManager.PERMISSION_GRANTED){
+                    showCameraScannerOverlay();
+
+                } else {
+                    manualEntryFallbackOrForced = true;
+                    // show manual entry - handled in onResume()
+                }
+                onResume();
             }
         }
     }
@@ -630,16 +676,28 @@ public final class CardIOActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        Log.d(TAG, String.format("onActivityResult(requestCode:%d, resultCode:%d, ...",
+                requestCode, resultCode));
 
-        if (requestCode == DATA_ENTRY_REQUEST_ID) {
-            if (resultCode == RESULT_CARD_INFO || resultCode == RESULT_ENTRY_CANCELED
-                    || manualEntryFallbackOrForced) {
-                setResultAndFinish(resultCode, data);
-            } else {
-                if (mUIBar != null) {
-                    mUIBar.setVisibility(View.VISIBLE);
+        switch (requestCode) {
+            case DATA_ENTRY_REQUEST_ID:
+                if (resultCode == RESULT_CANCELED) {
+                    Log.d(TAG, "ignoring onActivityResult(RESULT_CANCELED) caused only when Camera Permissions are Denied in Android 23");
+                } else if (resultCode == RESULT_CARD_INFO || resultCode == RESULT_ENTRY_CANCELED
+                        || manualEntryFallbackOrForced) {
+                    if (data != null && data.hasExtra(EXTRA_SCAN_RESULT)) {
+                        Log.v(TAG, "EXTRA_SCAN_RESULT: " + data.getParcelableExtra(EXTRA_SCAN_RESULT));
+                    } else {
+                        Log.d(TAG, "no data in EXTRA_SCAN_RESULT");
+                    }
+                    setResultAndFinish(resultCode, data);
+
+                } else {
+                    if (mUIBar != null) {
+                        mUIBar.setVisibility(View.VISIBLE);
+                    }
                 }
-            }
+                break;
         }
     }
 
@@ -651,6 +709,8 @@ public final class CardIOActivity extends Activity {
      */
     @Override
     public void onBackPressed() {
+        Log.d(TAG, "onBackPressed()");
+
         if (!manualEntryFallbackOrForced && mOverlay.isAnimating()) {
             try {
                 restartPreview();
@@ -691,15 +751,16 @@ public final class CardIOActivity extends Activity {
      * @return The String version of this SDK
      */
     public static String sdkVersion() {
-        return BuildConfig.VERSION_NAME;
+        return BuildConfig.PRODUCT_VERSION;
     }
 
     /**
-     * @deprecated Always returns {@code new Date()}.
+     * Returns the time this SDK was built.
+     *
+     * @return the time this SDK was built
      */
-    @Deprecated
     public static Date sdkBuildDate() {
-        return new Date();
+        return new Date(BuildConfig.BUILD_TIME);
     }
 
     /**
@@ -721,7 +782,8 @@ public final class CardIOActivity extends Activity {
 
     // end static
 
-    void onFirstFrame() {
+    void onFirstFrame(int orientation) {
+        Log.d(TAG, "onFirstFrame(" + orientation + ")");
         SurfaceView sv = mPreview.getSurfaceView();
         if (mOverlay != null) {
             mOverlay.setCameraPreviewRect(new Rect(sv.getLeft(), sv.getTop(), sv.getRight(), sv
@@ -730,6 +792,10 @@ public final class CardIOActivity extends Activity {
         mFrameOrientation = ORIENTATION_PORTRAIT;
         setDeviceDegrees(0);
 
+        if (orientation != mFrameOrientation) {
+            Log.wtf(Util.PUBLIC_LOG_TAG,
+                    "the orientation of the scanner doesn't match the orientation of the activity");
+        }
         onEdgeUpdate(new DetectionInfo());
     }
 
@@ -738,6 +804,8 @@ public final class CardIOActivity extends Activity {
     }
 
     void onCardDetected(Bitmap detectedBitmap, DetectionInfo dInfo) {
+        Log.d(TAG, "onCardDetected()");
+
         try {
             Vibrator vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
             vibrator.vibrate(VIBRATE_PATTERN, -1);
@@ -765,6 +833,7 @@ public final class CardIOActivity extends Activity {
         }
 
         Matrix m = new Matrix();
+        Log.d(TAG, "Scale factor: " + sf);
         m.postScale(sf, sf);
 
         Bitmap scaledCard = Bitmap.createBitmap(detectedBitmap, 0, 0, detectedBitmap.getWidth(),
@@ -782,6 +851,8 @@ public final class CardIOActivity extends Activity {
     }
 
     private void nextActivity() {
+        Log.d(TAG, "nextActivity()");
+
         final Intent origIntent = getIntent();
         if (origIntent != null && origIntent.getBooleanExtra(EXTRA_SUPPRESS_CONFIRMATION, false)) {
             Intent dataIntent = new Intent(CardIOActivity.this, DataEntryActivity.class);
@@ -797,6 +868,8 @@ public final class CardIOActivity extends Activity {
             new Handler().post(new Runnable() {
                 @Override
                 public void run() {
+                    Log.d(TAG, "post(Runnable)");
+
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
                     getWindow().addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
 
@@ -844,6 +917,8 @@ public final class CardIOActivity extends Activity {
     }
 
     private boolean restartPreview() {
+        Log.d(TAG, "restartPreview()");
+
         mDetectedCard = null;
         assert mPreview != null;
         boolean success = mCardScanner.resumeScanning(mPreview.getSurfaceHolder());
@@ -860,6 +935,8 @@ public final class CardIOActivity extends Activity {
         sv = mPreview.getSurfaceView();
 
         if (sv == null) {
+            Log.wtf(Util.PUBLIC_LOG_TAG,
+                    "surface view is null.. recovering... rotation might be weird.");
             return;
         }
 
@@ -920,6 +997,9 @@ public final class CardIOActivity extends Activity {
             if (color != 0) {
                 // force 100% opaque guide colors.
                 int alphaRemovedColor = color | 0xFF000000;
+                if (color != alphaRemovedColor) {
+                    Log.w(Util.PUBLIC_LOG_TAG, "Removing transparency from provided guide color.");
+                }
                 mOverlay.setGuideColor(alphaRemovedColor);
             } else {
                 // default to greeeeeen
@@ -1041,6 +1121,96 @@ public final class CardIOActivity extends Activity {
             return null;
         }
         return mOverlay.getTorchRect();
+    }
+
+    /*************************** TESSERACT Entry Point **************************/
+
+
+    private String DATA_PATH = "";
+    private final String TESSDATA = "tessdata";
+    private final String TESSCONFIG = "tessconfigs";
+
+    /*
+     * Entry point for tessdata adapted from TessTwo
+     */
+    private void tessSetup() {
+        DATA_PATH = getExternalFilesDir(null) + "/Tesseract/";//getFilesDir()+ "/Tesseract/";//getExternalFilesDir(null) + "/Tesseract/";//Environment.getExternalStorageDirectory().toString() + "/Tesseract/";
+        Log.i(TAG, "Attempting to copy tessdata");
+        Log.i(TAG, "Accessing: "+ DATA_PATH);
+        prepareTesseract();
+    }
+
+
+
+    /**
+     * Prepare directory on external storage
+     *
+     * @param path
+     * @throws Exception
+     */
+    private void prepareDirectory(String path) {
+
+        File dir = new File(path);
+        if (!dir.exists()) {
+            if (!dir.mkdirs()) {
+                Log.e(TAG, "ERROR: Creation of directory " + path + " failed, check does Android Manifest have permission to write to external storage?");
+            }
+        }
+        else {
+            Log.i(TAG, "Created directory " + path);
+        }
+    }
+
+
+    private void prepareTesseract() {
+        try {
+            prepareDirectory(DATA_PATH + TESSDATA);
+            prepareDirectory(DATA_PATH + TESSDATA + "/" + TESSCONFIG);
+        }
+        catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        copyTessDataFiles(TESSDATA);
+    }
+
+    /**
+     * Copy tessdata files (located on assets/tessdata) to destination directory
+     *
+     * @param path - name of directory with .traineddata files
+     */
+    private void copyTessDataFiles(String path) {
+        try {
+            String fileList[] = getAssets().list(path);
+
+            for (String fileName : fileList) {
+
+                // open file within the assets folder
+                // if it is not already there copy it to the sdcard
+                String pathToDataFile = DATA_PATH + path + "/" + fileName;
+                if (!(new File(pathToDataFile)).exists()) {
+
+                    InputStream in = getAssets().open(path + "/" + fileName);
+
+                    OutputStream out = new FileOutputStream(pathToDataFile);
+
+                    // Transfer bytes from in to out
+                    byte[] buf = new byte[1024];
+                    int len;
+
+                    while ((len = in.read(buf)) > 0) {
+                        out.write(buf, 0, len);
+                    }
+                    in.close();
+                    out.close();
+
+                    Log.d(TAG, "Copied " + fileName + " to tessdata");
+                }
+            }
+        }
+        catch (IOException e) {
+            Log.e(TAG, "Unable to copy files to tessdata " + e.toString());
+        }
     }
 
 }
